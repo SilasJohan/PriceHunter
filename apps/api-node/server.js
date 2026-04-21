@@ -13,9 +13,7 @@ const app = express();
 app.use(helmet());
 
 // 2. Controle de CORS
-app.use(cors({
-    origin: process.env.FRONTEND_URL || 'http://localhost:3000'
-}));
+app.use(cors());
 
 // 3. Limite de Payload (Evita ataques de negação de serviço com corpos gigantes)
 app.use(express.json({ limit: '10kb' })); 
@@ -26,7 +24,7 @@ const limiter = rateLimit({
     max: 100,
     message: { error: "Muitas requisições, tente novamente em 15 minutos." }
 });
-app.use('/api/', limiter);
+//app.use('/api/', limiter); TEMPORIRAMENTE FODASE NIGGER GAY
 
 // 5. Conexão Banco de Dados
 mongoose.connect(process.env.MONGO_URI)
@@ -35,54 +33,67 @@ mongoose.connect(process.env.MONGO_URI)
 
 // 6. Rota de Busca com Validação Manual de Segurança
 app.get('/api/search', async (req, res) => {
+    const { q } = req.query;
+    if (!q) return res.status(400).json({ error: "Query vazia" });
+
     try {
-        let { url } = req.query;
+        console.log(`🔍 Iniciando busca por: ${q}`);
+        
+        // 1. Chama o Python
+        const response = await axios.get(`http://localhost:8000/search?q=${encodeURIComponent(q)}`);
+        const scrapedProducts = response.data;
 
-        // SANITIZAÇÃO MANUAL: Remove caracteres que podem ser usados em ataques de script
-        // No contexto de URL, queremos apenas caracteres válidos de URL
-        if (url) {
-            url = url.replace(/[<>\"\'\(\)]/g, ''); 
+        console.log(`🐍 Python retornou ${scrapedProducts.length} itens.`);
+
+        if (scrapedProducts.length === 0) {
+            return res.json([]); // Se o Python falhou, para aqui.
         }
 
-        if (!url || !url.startsWith('https://www.mercadolivre.com.br')) {
-            return res.status(400).json({ 
-                error: "URL inválida. Por favor, use um link válido do Mercado Livre." 
-            });
-        }
+        // 2. Tenta salvar/atualizar no MongoDB
+        const productsWithHistory = await Promise.all(scrapedProducts.map(async (item) => {
+            try {
+                let product = await Product.findOne({ url: item.url });
 
-        // Chama o Scraper Python
-        const response = await axios.get(`http://localhost:8000/scrape?url=${encodeURIComponent(url)}`);
-        const scrapedData = response.data;
+                if (product) {
+                    if (product.currentPrice !== item.price) {
+                        product.priceHistory.push({ price: item.price });
+                        product.currentPrice = item.price;
+                        await product.save();
+                    }
+                    return product;
+                } else {
+                    const newProduct = new Product({
+                        title: item.title,
+                        currentPrice: item.price,
+                        image: item.image,
+                        url: item.url,
+                        store: item.store,
+                        priceHistory: [{ price: item.price }]
+                    });
+                    return await newProduct.save();
+                }
+            } catch (err) {
+                console.error("❌ Erro ao salvar item no banco:", err);
+                return item; // Se o banco falhar, retorna o item bruto do scraper
+            }
+        }));
 
-        if (scrapedData.error) {
-            return res.status(500).json({ error: scrapedData.error });
-        }
+        console.log(`✅ Enviando ${productsWithHistory.length} itens para o Front.`);
+        res.json(productsWithHistory);
 
-        // Lógica de Banco de Dados (Atualizar ou Criar)
-        let product = await Product.findOne({ url: scrapedData.url });
+    } catch (error) {
+        console.error("💥 Erro Crítico na Rota de Busca:", error.message);
+        res.status(500).json({ error: "Erro interno no servidor." });
+    }
+});
 
-        if (product) {
-            product.currentPrice = scrapedData.price;
-            product.history.push({ price: scrapedData.price });
-            product.lastUpdate = Date.now();
-            await product.save();
-        } else {
-            product = await Product.create({
-                title: scrapedData.title,
-                url: scrapedData.url,
-                store: scrapedData.store,
-                currentPrice: scrapedData.price,
-                history: [{ price: scrapedData.price }]
-            });
-        }
-
+app.get('/api/product-history', async (req, res) => {
+    const { url } = req.query;
+    try {
+        const product = await Product.findOne({ url: url });
         res.json(product);
     } catch (error) {
-        console.error("DEBUG - Erro detalhado:", error.response ? error.response.data : error.message);
-        res.status(500).json({ 
-            error: "Erro interno ao processar a busca.",
-            details: error.message 
-        });
+        res.status(500).json({ error: "Erro ao buscar histórico" });
     }
 });
 
